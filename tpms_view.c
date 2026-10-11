@@ -1,4 +1,5 @@
 #include "tpms_view.h"
+#include "laszlo_portrait_40.h"
 #include "tpms_radio.h"
 
 #include <furi.h>
@@ -20,6 +21,7 @@
  * plenty to tell one wheel from another, and the detail screen has the
  * whole thing. */
 #define TPMS_ROW_ID_DIGITS 6
+#define TPMS_WAKE_FEEDBACK_MS 1500
 
 /** Bars in the signal level indicator. */
 #define TPMS_BAR_COUNT 4
@@ -59,6 +61,19 @@ static void
             canvas_draw_dot(canvas, bar_x + 1, bottom - 1);
         }
     }
+}
+
+static void tpms_view_draw_lamp(Canvas* canvas, int32_t x, int32_t y, bool on) {
+    if(on) {
+        canvas_draw_disc(canvas, x + 4, y + 3, 3);
+        canvas_draw_line(canvas, x + 4, y - 1, x + 4, y - 3);
+        canvas_draw_line(canvas, x, y + 1, x - 2, y);
+        canvas_draw_line(canvas, x + 8, y + 1, x + 10, y);
+    } else {
+        canvas_draw_circle(canvas, x + 4, y + 3, 3);
+    }
+    canvas_draw_line(canvas, x + 2, y + 7, x + 6, y + 7);
+    canvas_draw_line(canvas, x + 3, y + 8, x + 5, y + 8);
 }
 
 /** Pressure in bar, two decimals. Everything is carried in hundredths of
@@ -105,7 +120,7 @@ static void tpms_view_draw_header(Canvas* canvas, TpmsBridgeApp* app) {
      * modulation the app is listening on is the one thing that decides
      * whether anything can show up at all. While scanning, AUTO says the
      * setting is about to move on by itself. */
-    const bool scanning = app->config == TpmsConfigScan;
+    const bool scanning = tpms_config_is_auto((TpmsConfig)app->config);
     const char* band = tpms_slot_frequency(app->active_slot) == tpms_frequencies[0] ? "433" :
                                                                                       "315";
     const char mode = tpms_slot_modulation(app->active_slot) == TpmsModulationOok ?
@@ -113,28 +128,24 @@ static void tpms_view_draw_header(Canvas* canvas, TpmsBridgeApp* app) {
                           (scanning ? 'f' : 'F');
 
     char setting[TPMS_TEXT_MAX];
-    snprintf(setting, sizeof(setting), "%s%s%c", scanning ? "AUTO-" : "", band, mode);
+    snprintf(setting, sizeof(setting), "%s%s%c", scanning ? "auto" : "", band, mode);
 
     canvas_set_font(canvas, FontPrimary);
     canvas_draw_str(canvas, TPMS_LIST_LEFT, 10, setting);
 
-    const char* radio = "off";
+    const char* radio = "RX OFF";
     if(app->exit_blocked) {
         radio = "wait";
     } else if(app->usb_streaming) {
         radio = "USB";
     } else if(app->local_rx) {
-        radio = "RX";
+        radio = app->rx_device_external ? "RX EXT" : "RX INT";
+    } else if(app->rx_enabled) {
+        radio = "RX wait";
     }
 
     char status[TPMS_TEXT_MAX];
-    snprintf(
-        status,
-        sizeof(status),
-        "%u %s%s",
-        (unsigned)app->store.count,
-        radio,
-        app->raw_save ? " RAW" : (app->auto_wake ? " wake" : ""));
+    snprintf(status, sizeof(status), "%u %s", (unsigned)app->store.count, radio);
 
     canvas_set_font(canvas, FontSecondary);
     canvas_draw_str_aligned(canvas, 126, 10, AlignRight, AlignBottom, status);
@@ -183,11 +194,34 @@ static void tpms_view_draw_row(
 static void tpms_view_draw_list(Canvas* canvas, TpmsBridgeApp* app) {
     tpms_view_draw_header(canvas, app);
     canvas_set_font(canvas, FontSecondary);
+    const bool wake_feedback =
+        app->wake_feedback_tick &&
+        (furi_get_tick() - app->wake_feedback_tick < furi_ms_to_ticks(TPMS_WAKE_FEEDBACK_MS));
 
     if(app->store.count == 0) {
-        canvas_draw_str_aligned(canvas, 64, 27, AlignCenter, AlignBottom, "Listening...");
-        canvas_draw_str_aligned(canvas, 64, 39, AlignCenter, AlignBottom, "Right: wake sensor");
-        canvas_draw_str_aligned(canvas, 64, 50, AlignCenter, AlignBottom, "Up/Down: band, mode");
+        const char* spinner[] = {"|", "/", "-", "\\"};
+        const char* rx = app->local_rx ? spinner[(furi_get_tick() / 250) % 4] : "off";
+        char watch[TPMS_TEXT_MAX];
+        if(app->local_rx) {
+            snprintf(watch, sizeof(watch), "RX %s watching %s", app->rx_device_external ? "EXT" : "INT", rx);
+        } else {
+            snprintf(watch, sizeof(watch), app->rx_enabled ? "RX starting" : "RX OFF");
+        }
+        canvas_draw_str_aligned(canvas, 64, 27, AlignCenter, AlignBottom, watch);
+        snprintf(
+            watch,
+            sizeof(watch),
+            "Frames:%lu IDs:%u",
+            (unsigned long)app->store.total_frames,
+            (unsigned)app->store.count);
+        canvas_draw_str_aligned(canvas, 64, 39, AlignCenter, AlignBottom, watch);
+        canvas_draw_str_aligned(
+            canvas,
+            64,
+            50,
+            AlignCenter,
+            AlignBottom,
+            wake_feedback ? "Wake pulse" : "Up/Down: band, mode");
     } else {
         const uint32_t now = furi_get_tick();
         for(uint8_t row = 0; row < TPMS_VIEW_ROWS; row++) {
@@ -216,9 +250,10 @@ static void tpms_view_draw_list(Canvas* canvas, TpmsBridgeApp* app) {
 
     /* Spread the hints across the width: they do not fit as one string. */
     canvas_draw_line(canvas, 0, 54, 127, 54);
-    canvas_draw_str(canvas, TPMS_LIST_LEFT, 62, "OK:info");
-    canvas_draw_str_aligned(canvas, 64, 62, AlignCenter, AlignBottom, "hold L:RAW");
-    canvas_draw_str_aligned(canvas, 126, 62, AlignRight, AlignBottom, "R:wake");
+    canvas_draw_str(canvas, TPMS_LIST_LEFT, 62, app->raw_save ? "RAW On" : "RAW Off");
+    tpms_view_draw_lamp(canvas, 54, 55, app->keep_backlight_on);
+    canvas_draw_str(canvas, 66, 62, wake_feedback ? "Wake" : (app->keep_backlight_on ? "ON" : "OFF"));
+    canvas_draw_str_aligned(canvas, 126, 62, AlignRight, AlignBottom, "R:files");
 }
 
 static void tpms_view_draw_detail(Canvas* canvas, TpmsBridgeApp* app) {
@@ -292,11 +327,222 @@ static void tpms_view_draw_detail(Canvas* canvas, TpmsBridgeApp* app) {
     canvas_draw_str_aligned(canvas, 126, 62, AlignRight, AlignBottom, text);
 }
 
+static void tpms_view_draw_raw_title(Canvas* canvas, const char* title) {
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, TPMS_LIST_LEFT, 10, title);
+    canvas_draw_line(canvas, 0, 12, 127, 12);
+}
+
+static void tpms_view_draw_raw_files(Canvas* canvas, TpmsBridgeApp* app) {
+    tpms_view_draw_raw_title(canvas, "RAW files");
+    canvas_set_font(canvas, FontSecondary);
+
+    if(app->raw_file_count == 0) {
+        canvas_draw_str_aligned(canvas, 64, 30, AlignCenter, AlignBottom, "No .sub files");
+        canvas_draw_str_aligned(canvas, 64, 42, AlignCenter, AlignBottom, "Record first");
+    } else {
+        for(uint8_t row = 0; row < TPMS_RAW_FILE_ROWS; row++) {
+            const uint8_t index = app->raw_file_scroll + row;
+            if(index >= app->raw_file_count) break;
+
+            const int32_t top = TPMS_ROW_TOP + row * TPMS_ROW_HEIGHT;
+            if(index == app->raw_file_selected) {
+                canvas_draw_box(canvas, 0, top, 124, TPMS_ROW_HEIGHT);
+                canvas_set_color(canvas, ColorWhite);
+            }
+
+            char text[TPMS_TEXT_MAX];
+            snprintf(text, sizeof(text), "%u %s", (unsigned)(index + 1), app->raw_file_names[index]);
+            canvas_draw_str(canvas, TPMS_LIST_LEFT, top + 8, text);
+
+            if(index == app->raw_file_selected) canvas_set_color(canvas, ColorBlack);
+        }
+
+        if(app->raw_file_count > TPMS_RAW_FILE_ROWS) {
+            elements_scrollbar_pos(
+                canvas,
+                128,
+                TPMS_ROW_TOP,
+                TPMS_RAW_FILE_ROWS * TPMS_ROW_HEIGHT,
+                app->raw_file_selected,
+                app->raw_file_count);
+        }
+    }
+
+    canvas_draw_line(canvas, 0, 54, 127, 54);
+    canvas_draw_str(canvas, TPMS_LIST_LEFT, 62, "OK:menu");
+    canvas_draw_str_aligned(canvas, 64, 62, AlignCenter, AlignBottom, "R:help");
+    canvas_draw_str_aligned(canvas, 126, 62, AlignRight, AlignBottom, "Back");
+}
+
+static const char* tpms_view_raw_action_label(uint8_t action) {
+    switch(action) {
+    case 0:
+        return "Play";
+    case 1:
+        return "Information";
+    case 2:
+        return "Rename";
+    case 3:
+        return "Delete";
+    default:
+        return "";
+    }
+}
+
+static void tpms_view_draw_raw_menu(Canvas* canvas, TpmsBridgeApp* app) {
+    tpms_view_draw_raw_title(canvas, "RAW action");
+    canvas_set_font(canvas, FontSecondary);
+
+    canvas_draw_str(canvas, TPMS_LIST_LEFT, 22, app->raw_file_names[app->raw_file_selected]);
+    for(uint8_t row = 0; row < 4; row++) {
+        const int32_t top = 25 + row * 9;
+        if(row == app->raw_menu_selected) {
+            canvas_draw_box(canvas, 0, top, 124, 9);
+            canvas_set_color(canvas, ColorWhite);
+        }
+        canvas_draw_str(canvas, TPMS_LIST_LEFT + 4, top + 7, tpms_view_raw_action_label(row));
+        if(row == app->raw_menu_selected) canvas_set_color(canvas, ColorBlack);
+    }
+
+    canvas_draw_line(canvas, 0, 54, 127, 54);
+    canvas_draw_str(canvas, TPMS_LIST_LEFT, 62, "OK");
+    canvas_draw_str_aligned(canvas, 126, 62, AlignRight, AlignBottom, "Back");
+}
+
+static void tpms_view_draw_raw_info(Canvas* canvas, TpmsBridgeApp* app) {
+    char text[TPMS_TEXT_MAX];
+
+    tpms_view_draw_raw_title(canvas, "RAW info");
+    canvas_set_font(canvas, FontSecondary);
+
+    canvas_draw_str(canvas, TPMS_LIST_LEFT, 22, app->raw_file_names[app->raw_file_selected]);
+    snprintf(text, sizeof(text), "Size:%lu", (unsigned long)app->raw_file_size);
+    canvas_draw_str(canvas, TPMS_LIST_LEFT, 33, text);
+    if(app->raw_file_frequency) {
+        snprintf(text, sizeof(text), "F:%lu", (unsigned long)app->raw_file_frequency);
+        canvas_draw_str(canvas, TPMS_LIST_LEFT, 43, text);
+    } else {
+        canvas_draw_str(canvas, TPMS_LIST_LEFT, 43, "F:-");
+    }
+    snprintf(
+        text,
+        sizeof(text),
+        "P:%s",
+        app->raw_file_protocol[0] ? app->raw_file_protocol : "-");
+    canvas_draw_str(canvas, TPMS_LIST_LEFT, 53, text);
+
+    canvas_draw_line(canvas, 0, 54, 127, 54);
+    canvas_draw_str_aligned(canvas, 126, 62, AlignRight, AlignBottom, "Back");
+}
+
+static void tpms_view_draw_raw_confirm_delete(Canvas* canvas, TpmsBridgeApp* app) {
+    tpms_view_draw_raw_title(canvas, "Delete RAW?");
+    canvas_set_font(canvas, FontSecondary);
+
+    canvas_draw_str(canvas, TPMS_LIST_LEFT, 27, app->raw_file_names[app->raw_file_selected]);
+    canvas_draw_str(canvas, TPMS_LIST_LEFT, 42, "OK deletes file");
+
+    canvas_draw_line(canvas, 0, 54, 127, 54);
+    canvas_draw_str(canvas, TPMS_LIST_LEFT, 62, "OK:delete");
+    canvas_draw_str_aligned(canvas, 126, 62, AlignRight, AlignBottom, "Back");
+}
+
+static void tpms_view_draw_raw_message(Canvas* canvas, TpmsBridgeApp* app) {
+    tpms_view_draw_raw_title(canvas, "RAW");
+    canvas_set_font(canvas, FontSecondary);
+
+    canvas_draw_str_aligned(canvas, 64, 34, AlignCenter, AlignBottom, app->raw_message);
+    canvas_draw_line(canvas, 0, 54, 127, 54);
+    canvas_draw_str_aligned(canvas, 126, 62, AlignRight, AlignBottom, "Back");
+}
+
+static void tpms_view_draw_raw_tx(Canvas* canvas, TpmsBridgeApp* app) {
+    tpms_view_draw_raw_title(canvas, "RAW play");
+    canvas_set_font(canvas, FontSecondary);
+
+    const char* status = app->raw_tx_finishing ? "Finishing..." :
+                         app->raw_tx_active ?
+                             (app->tx_device_external ? "TX EXT" : "TX INT") :
+                             app->raw_message;
+    canvas_draw_str_aligned(canvas, 64, 34, AlignCenter, AlignBottom, status);
+    if(!app->raw_tx_active && !app->raw_tx_finishing) {
+        canvas_draw_str_aligned(canvas, 64, 46, AlignCenter, AlignBottom, "Press OK");
+    }
+    canvas_draw_line(canvas, 0, 54, 127, 54);
+    canvas_draw_str(canvas, TPMS_LIST_LEFT, 62, "Hold OK");
+    canvas_draw_str_aligned(canvas, 126, 62, AlignRight, AlignBottom, "Back");
+}
+
+static void tpms_view_draw_raw_help(Canvas* canvas, TpmsBridgeApp* app) {
+    char title[TPMS_TEXT_MAX];
+    snprintf(title, sizeof(title), "Help %u/5", (unsigned)(app->raw_help_page + 1));
+    tpms_view_draw_raw_title(canvas, title);
+    canvas_set_font(canvas, FontSecondary);
+
+    switch(app->raw_help_page) {
+    case 0:
+        canvas_draw_str(canvas, TPMS_LIST_LEFT, 22, "Main screen:");
+        canvas_draw_str(canvas, TPMS_LIST_LEFT, 32, "OK: RX on/off");
+        canvas_draw_str(canvas, TPMS_LIST_LEFT, 42, "Hold OK: light");
+        canvas_draw_str(canvas, TPMS_LIST_LEFT, 52, "R: RAW files");
+        break;
+    case 1:
+        canvas_draw_str(canvas, TPMS_LIST_LEFT, 22, "RAW save:");
+        canvas_draw_str(canvas, TPMS_LIST_LEFT, 32, "Hold L: ON/OFF");
+        canvas_draw_str(canvas, TPMS_LIST_LEFT, 42, "L: wake pulse");
+        canvas_draw_str(canvas, TPMS_LIST_LEFT, 52, "Save after decode");
+        break;
+    case 2:
+        canvas_draw_str(canvas, TPMS_LIST_LEFT, 22, "Files:");
+        canvas_draw_str(canvas, TPMS_LIST_LEFT, 32, "OK: file actions");
+        canvas_draw_str(canvas, TPMS_LIST_LEFT, 42, "Info shows size");
+        canvas_draw_str(canvas, TPMS_LIST_LEFT, 52, "Delete asks first");
+        break;
+    case 3:
+        canvas_draw_str(canvas, TPMS_LIST_LEFT, 22, "Important:");
+        canvas_draw_str(canvas, TPMS_LIST_LEFT, 32, "Play uses Sub-GHz");
+        canvas_draw_str(canvas, TPMS_LIST_LEFT, 42, "Rename: type name");
+        canvas_draw_str(canvas, TPMS_LIST_LEFT, 52, "Delete asks first");
+        break;
+    default:
+        canvas_draw_xbm(
+            canvas,
+            6,
+            16,
+            LASZLO_PORTRAIT_40_WIDTH,
+            LASZLO_PORTRAIT_40_HEIGHT,
+            laszlo_portrait_40);
+        canvas_draw_str(canvas, 55, 32, TPMS_APP_TITLE);
+        canvas_draw_str(canvas, 55, 42, TPMS_APP_VERSION);
+        canvas_draw_str(canvas, 55, 52, "By Laszlo");
+        break;
+    }
+
+    canvas_draw_line(canvas, 0, 54, 127, 54);
+    canvas_draw_str(canvas, TPMS_LIST_LEFT, 62, "Up/Down");
+    canvas_draw_str_aligned(canvas, 126, 62, AlignRight, AlignBottom, "Back");
+}
+
 void tpms_view_draw(Canvas* canvas, TpmsBridgeApp* app) {
     canvas_clear(canvas);
     canvas_set_color(canvas, ColorBlack);
 
-    if(app->screen == TpmsScreenDetail && app->selected < app->store.count) {
+    if(app->screen == TpmsScreenRawFiles) {
+        tpms_view_draw_raw_files(canvas, app);
+    } else if(app->screen == TpmsScreenRawMenu && app->raw_file_count > 0) {
+        tpms_view_draw_raw_menu(canvas, app);
+    } else if(app->screen == TpmsScreenRawInfo && app->raw_file_count > 0) {
+        tpms_view_draw_raw_info(canvas, app);
+    } else if(app->screen == TpmsScreenRawConfirmDelete && app->raw_file_count > 0) {
+        tpms_view_draw_raw_confirm_delete(canvas, app);
+    } else if(app->screen == TpmsScreenRawMessage) {
+        tpms_view_draw_raw_message(canvas, app);
+    } else if(app->screen == TpmsScreenRawTx) {
+        tpms_view_draw_raw_tx(canvas, app);
+    } else if(app->screen == TpmsScreenRawHelp) {
+        tpms_view_draw_raw_help(canvas, app);
+    } else if(app->screen == TpmsScreenDetail && app->selected < app->store.count) {
         tpms_view_draw_detail(canvas, app);
     } else {
         tpms_view_draw_list(canvas, app);

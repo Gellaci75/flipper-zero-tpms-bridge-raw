@@ -6,6 +6,7 @@
 #include <furi_hal.h>
 #include <lib/subghz/devices/devices.h>
 #include <lib/subghz/devices/cc1101_int/cc1101_int_interconnect.h>
+#include <applications/drivers/subghz/cc1101_ext/cc1101_ext_interconnect.h>
 #include <toolbox/level_duration.h>
 
 #define TAG "TpmsSession"
@@ -20,6 +21,8 @@
 
 struct TpmsSession {
     const SubGhzDevice* device;
+    bool device_external;
+    bool external_power_owned;
     FuriStreamBuffer* stream;
     TpmsDecoder* decoder;
 
@@ -72,6 +75,17 @@ static void tpms_session_load_preset(TpmsSession* session) {
     subghz_devices_set_frequency(session->device, session->frequency);
 }
 
+static bool tpms_session_external_power_on(bool* owned) {
+    *owned = false;
+    if(furi_hal_power_is_otg_enabled()) return true;
+    for(uint8_t attempt = 0; attempt < 5 && !furi_hal_power_is_otg_enabled(); attempt++) {
+        furi_hal_power_enable_otg();
+        furi_delay_ms(10);
+    }
+    *owned = furi_hal_power_is_otg_enabled();
+    return *owned;
+}
+
 TpmsSession* tpms_session_alloc(void) {
     TpmsSession* session = malloc(sizeof(TpmsSession));
     memset(session, 0, sizeof(TpmsSession));
@@ -113,24 +127,42 @@ bool tpms_session_start(TpmsSession* session, uint32_t frequency, TpmsModulation
     furi_check(!session->running);
 
     subghz_devices_init();
-    session->device = subghz_devices_get_by_name(SUBGHZ_DEVICE_CC1101_INT_NAME);
+    session->device_external = false;
+    session->external_power_owned = false;
+    bool ext_power_owned = false;
+    const bool ext_power_ok = tpms_session_external_power_on(&ext_power_owned);
+    session->device = subghz_devices_get_by_name(SUBGHZ_DEVICE_CC1101_EXT_NAME);
+    if(ext_power_ok && session->device && subghz_devices_begin(session->device)) {
+        session->device_external = true;
+        session->external_power_owned = ext_power_owned;
+    } else {
+        if(session->device) subghz_devices_end(session->device);
+        if(ext_power_owned && furi_hal_power_is_otg_enabled()) furi_hal_power_disable_otg();
+        session->device = subghz_devices_get_by_name(SUBGHZ_DEVICE_CC1101_INT_NAME);
+    }
     if(!session->device) {
-        FURI_LOG_E(TAG, "no cc1101_int device");
+        FURI_LOG_E(TAG, "no cc1101 device");
         subghz_devices_deinit();
         return false;
     }
 
     if(!subghz_devices_is_frequency_valid(session->device, frequency)) {
         FURI_LOG_E(TAG, "frequency %lu is not valid", frequency);
+        subghz_devices_end(session->device);
         subghz_devices_deinit();
+        if(session->external_power_owned && furi_hal_power_is_otg_enabled()) {
+            furi_hal_power_disable_otg();
+        }
         session->device = NULL;
+        session->device_external = false;
+        session->external_power_owned = false;
         return false;
     }
 
     session->frequency = frequency;
     session->modulation = modulation;
 
-    subghz_devices_begin(session->device);
+    if(!session->device_external) subghz_devices_begin(session->device);
     subghz_devices_reset(session->device);
     subghz_devices_idle(session->device);
     tpms_session_load_preset(session);
@@ -155,9 +187,19 @@ void tpms_session_stop(TpmsSession* session) {
     subghz_devices_sleep(session->device);
     subghz_devices_end(session->device);
     subghz_devices_deinit();
+    if(session->external_power_owned && furi_hal_power_is_otg_enabled()) {
+        furi_hal_power_disable_otg();
+    }
 
     session->device = NULL;
+    session->device_external = false;
+    session->external_power_owned = false;
     session->running = false;
+}
+
+bool tpms_session_is_external(TpmsSession* session) {
+    furi_check(session);
+    return session->device_external;
 }
 
 bool tpms_session_retune(TpmsSession* session, uint32_t frequency, TpmsModulation modulation) {

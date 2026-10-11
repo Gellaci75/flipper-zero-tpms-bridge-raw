@@ -9,8 +9,11 @@
 #include <gui/gui.h>
 #include <gui/view_port.h>
 #include <input/input.h>
+#include <notification/notification.h>
 
 #define TPMS_CLI_COMMAND_NAME "tpms_rx"
+#define TPMS_APP_TITLE "TPMS Studio"
+#define TPMS_APP_VERSION "v1.0"
 
 /** Stack size of the CLI command thread. */
 #define TPMS_CLI_STACK_SIZE (4 * 1024)
@@ -25,7 +28,20 @@
 typedef enum {
     TpmsScreenList, /**< sensor list */
     TpmsScreenDetail, /**< details of the selected sensor */
+    TpmsScreenRawFiles, /**< saved raw captures */
+    TpmsScreenRawMenu, /**< actions for selected raw file */
+    TpmsScreenRawInfo, /**< selected raw file info */
+    TpmsScreenRawConfirmDelete, /**< delete confirmation */
+    TpmsScreenRawMessage, /**< short placeholder/status message */
+    TpmsScreenRawHelp, /**< built-in usage notes */
+    TpmsScreenRawTx, /**< hold-to-transmit status */
 } TpmsScreen;
+
+#define TPMS_RAW_FILE_ROWS 4
+#define TPMS_RAW_FILE_MAX 16
+#define TPMS_RAW_NAME_MAX 64
+#define TPMS_RAW_MESSAGE_MAX 48
+#define TPMS_RAW_RENAME_MAX 64
 
 /** Shared state: what gets drawn on the screen, plus arbitration of the
  * radio between local reception and the USB session. */
@@ -45,12 +61,24 @@ typedef struct {
     volatile bool radio_yield_requested;
 
     volatile bool local_rx; /**< the local RX thread should be running */
+    bool rx_enabled; /**< user-controlled local RX start/stop */
     uint32_t radio_retry_tick; /**< when the radio was last claimed */
     bool usb_streaming;
     bool exit_blocked;
     volatile bool wake_requested; /**< single pulse requested by a key */
     volatile bool raw_save; /**< hold Left to toggle */
     volatile bool auto_wake; /**< periodic pulses */
+    bool keep_backlight_on;
+    bool rx_device_external;
+    bool tx_device_external;
+    bool raw_tx_active;
+    bool raw_tx_finishing;
+    bool raw_tx_button_down;
+    uint32_t wake_feedback_tick;
+    uint32_t last_rx_blink_tick;
+    uint32_t last_tx_blink_tick;
+    uint32_t tx_cooldown_until_tick;
+    uint32_t last_radio_stop_tick;
 
     /* Radio configuration, changed from the keys and applied by whoever
      * owns the radio. */
@@ -63,8 +91,22 @@ typedef struct {
     TpmsScreen screen;
     uint8_t selected;
     uint8_t scroll;
+    uint8_t raw_file_count;
+    uint8_t raw_file_selected;
+    uint8_t raw_file_scroll;
+    uint8_t raw_menu_selected;
+    uint8_t raw_help_page;
+    uint64_t raw_file_size;
+    uint32_t raw_file_frequency;
+    char raw_file_protocol[16];
+    char raw_tx_path[96];
+    void* raw_tx;
+    char raw_file_names[TPMS_RAW_FILE_MAX][TPMS_RAW_NAME_MAX];
+    char raw_message[TPMS_RAW_MESSAGE_MAX];
+    char rename_buffer[TPMS_RAW_RENAME_MAX];
 
     Gui* gui;
+    NotificationApp* notifications;
     ViewPort* view_port;
     FuriMessageQueue* input_queue;
     CliRegistry* cli_registry;

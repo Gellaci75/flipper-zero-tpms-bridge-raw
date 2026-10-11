@@ -41,6 +41,7 @@ void tpms_session_set_raw_callback(
 
 bool tpms_session_start(TpmsSession* session, uint32_t frequency, TpmsModulation modulation);
 void tpms_session_stop(TpmsSession* session);
+bool tpms_session_is_external(TpmsSession* session);
 
 /** Retune the running session.
  *

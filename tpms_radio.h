@@ -11,16 +11,16 @@
 #define TPMS_FREQUENCY_COUNT 2
 extern const uint32_t tpms_frequencies[TPMS_FREQUENCY_COUNT];
 
-/** What the radio is set up for. The first four are the combinations of
- * band and modulation; the last one steps through all four in turn, which
- * finds a sensor whose kind is not known in advance at the cost of
- * hearing each of them a quarter of the time. */
+/** What the radio is set up for. The first four are fixed combinations.
+ * The auto modes sweep only one band, matching the original TPMS Bridge
+ * choices while keeping the known decoder path intact. */
 typedef enum {
     TpmsConfig433Fsk,
     TpmsConfig433Ook,
     TpmsConfig315Fsk,
     TpmsConfig315Ook,
-    TpmsConfigScan,
+    TpmsConfigAuto433,
+    TpmsConfigAuto315,
     TpmsConfigCount,
 } TpmsConfig;
 
@@ -33,3 +33,6 @@ typedef enum {
 /** Band and modulation of one of the four combinations. */
 uint32_t tpms_slot_frequency(uint8_t slot);
 TpmsModulation tpms_slot_modulation(uint8_t slot);
+bool tpms_config_is_auto(TpmsConfig config);
+uint8_t tpms_config_first_slot(TpmsConfig config);
+uint8_t tpms_config_slot_count(TpmsConfig config);

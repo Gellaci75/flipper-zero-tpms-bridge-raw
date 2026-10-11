@@ -167,7 +167,7 @@ static void tpms_cli_collect_raw(bool level, uint32_t duration, void* context) {
 void tpms_cli_command(PipeSide* pipe, FuriString* args, void* context) {
     TpmsBridgeApp* app = context;
 
-    const uint8_t current_slot = app->config == TpmsConfigScan ?
+    const uint8_t current_slot = tpms_config_is_auto((TpmsConfig)app->config) ?
                                      app->active_slot :
                                      (uint8_t)(app->config % TPMS_SLOT_COUNT);
 
@@ -175,7 +175,7 @@ void tpms_cli_command(PipeSide* pipe, FuriString* args, void* context) {
     TpmsModulation modulation = tpms_slot_modulation(current_slot);
     uint8_t band = (uint8_t)(current_slot / 2);
     bool pinned_frequency = false;
-    bool scan_requested = app->config == TpmsConfigScan;
+    bool scan_requested = tpms_config_is_auto((TpmsConfig)app->config);
     bool raw_mode = false;
     bool wake_enabled = false;
 
@@ -233,8 +233,10 @@ void tpms_cli_command(PipeSide* pipe, FuriString* args, void* context) {
      * keep working while a computer is listening. */
     if(!pinned_frequency) {
         app->config = scan_requested ?
-                          (uint8_t)TpmsConfigScan :
+                          (uint8_t)(band == 0 ? TpmsConfigAuto433 : TpmsConfigAuto315) :
                           (uint8_t)(band * 2 + (modulation == TpmsModulationOok ? 1 : 0));
+        app->scan_step = 0;
+        app->scan_tick = 0;
     }
 
     /* The radio is almost always busy with local reception — it starts on
@@ -292,7 +294,8 @@ void tpms_cli_command(PipeSide* pipe, FuriString* args, void* context) {
         (unsigned long)frequency,
         raw_mode ? "raw" : "json",
         wake_enabled ? "true" : "false",
-        app->config == TpmsConfigScan ? "scan" : (modulation == TpmsModulationOok ? "ook" : "fsk"),
+        tpms_config_is_auto((TpmsConfig)app->config) ? "scan" :
+                                                       (modulation == TpmsModulationOok ? "ook" : "fsk"),
         (unsigned)tpms_protocol_count);
     tpms_cli_emit(&cli, started);
 
