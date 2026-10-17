@@ -1,4 +1,5 @@
 #include "tpms_bridge.h"
+#include "tpms_decoder.h"
 #include "tpms_lf.h"
 #include "tpms_view.h"
 
@@ -23,6 +24,7 @@
 #include <notification/notification_messages.h>
 #include <power/power_service/power.h>
 #include <storage/storage.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -34,6 +36,7 @@
 #define TPMS_RADIO_RETRY_MS 1000
 #define TPMS_RADIO_SWITCH_DELAY_MS 1000
 #define TPMS_TX_COOLDOWN_MS 1000
+#define TPMS_TX_DISPLAY_HOLD_MS 1200
 
 /* Bounded pre-trigger pulse history. A decoded TPMS frame triggers a save.
  * This is demodulated level/duration data, NOT RF IQ samples. */
@@ -41,12 +44,16 @@
 #define TPMS_RAW_MAX_FILES 100
 #define TPMS_RAW_DIR "/ext/subghz/TPMS_Bridge_RAW"
 #define TPMS_RAW_HELP_PAGES 5
+#define TPMS_RAW_POST_CAPTURE_MS 250
+#define TPMS_RAW_DUPLICATE_HOLD_MS 30000
 
 typedef enum {
+    TpmsRawActionOpen,
     TpmsRawActionPlay,
-    TpmsRawActionInfo,
+    TpmsRawActionRawInfo,
     TpmsRawActionRename,
     TpmsRawActionDelete,
+    TpmsRawActionDeleteAll,
     TpmsRawActionCount,
 } TpmsRawAction;
 
@@ -58,6 +65,15 @@ typedef struct {
     size_t snapshot_count;
     uint32_t frequency;
     TpmsModulation modulation;
+    TpmsFrame frame;
+    int16_t rssi_x10;
+    bool has_frame;
+    bool post_capture;
+    uint32_t post_until_tick;
+    uint8_t last_saved_protocol;
+    uint32_t last_saved_id;
+    uint32_t last_saved_tick;
+    bool last_saved_valid;
     uint16_t next_file;
     bool pending;
 } TpmsRawCapture;
@@ -71,15 +87,31 @@ static void tpms_raw_interval(bool level, uint32_t duration, void* context) {
 }
 
 static void tpms_raw_frame(const TpmsFrame* frame, float rssi, void* context) {
-    UNUSED(frame);
-    UNUSED(rssi);
     TpmsRawCapture* capture = context;
-    if(capture->pending || !capture->count) return;
+    if(capture->pending || capture->post_capture || !capture->count) return;
+    const uint32_t now = furi_get_tick();
+    if(capture->last_saved_valid && capture->last_saved_protocol == frame->protocol &&
+       capture->last_saved_id == frame->id &&
+       now - capture->last_saved_tick < furi_ms_to_ticks(TPMS_RAW_DUPLICATE_HOLD_MS)) {
+        return;
+    }
+    capture->frame = *frame;
+    capture->rssi_x10 = (int16_t)(rssi * 10.0f);
+    capture->has_frame = true;
+    capture->post_capture = true;
+    capture->post_until_tick = now + furi_ms_to_ticks(TPMS_RAW_POST_CAPTURE_MS);
+}
+
+static void tpms_raw_finish_post_capture(TpmsRawCapture* capture) {
+    if(!capture->post_capture || capture->pending || !capture->count) return;
+    if((int32_t)(furi_get_tick() - capture->post_until_tick) < 0) return;
+
     capture->snapshot_count = capture->count;
     const size_t start = (capture->head + TPMS_RAW_CAPACITY - capture->count) % TPMS_RAW_CAPACITY;
     for(size_t i = 0; i < capture->count; i++) {
         capture->snapshot[i] = capture->pulses[(start + i) % TPMS_RAW_CAPACITY];
     }
+    capture->post_capture = false;
     capture->pending = true;
 }
 
@@ -87,6 +119,9 @@ static void tpms_raw_clear(TpmsRawCapture* capture) {
     capture->head = 0;
     capture->count = 0;
     capture->pending = false;
+    capture->has_frame = false;
+    capture->post_capture = false;
+    capture->post_until_tick = 0;
 }
 
 static void tpms_raw_make_timestamp_name(
@@ -100,9 +135,9 @@ static void tpms_raw_make_timestamp_name(
         snprintf(
             name,
             name_size,
-            "%s_%04u-%02u-%02u_%02u%02u.sub",
+            "%s_%02u.%02u.%02u_%02u%02u.sub",
             prefix,
-            datetime.year,
+            (uint8_t)(datetime.year % 100),
             datetime.month,
             datetime.day,
             datetime.hour,
@@ -111,9 +146,9 @@ static void tpms_raw_make_timestamp_name(
         snprintf(
             name,
             name_size,
-            "%s_%04u-%02u-%02u_%02u%02u_%02u.sub",
+            "%s_%02u.%02u.%02u_%02u%02u_%02u.sub",
             prefix,
-            datetime.year,
+            (uint8_t)(datetime.year % 100),
             datetime.month,
             datetime.day,
             datetime.hour,
@@ -153,6 +188,31 @@ static void tpms_raw_save(TpmsRawCapture* capture) {
             RAW_WRITE("Preset: FuriHalSubGhzPreset2FSKDev476Async\n");
         }
         RAW_WRITE("Protocol: RAW\n");
+        if(capture->has_frame) {
+            const TpmsFrame* frame = &capture->frame;
+            snprintf(line, sizeof(line), "TPMSProtocol: %u\n", (unsigned)frame->protocol);
+            RAW_WRITE(line);
+            snprintf(line, sizeof(line), "TPMSID: %lu\n", (unsigned long)frame->id);
+            RAW_WRITE(line);
+            snprintf(line, sizeof(line), "TPMSHave: %u\n", (unsigned)frame->have);
+            RAW_WRITE(line);
+            snprintf(line, sizeof(line), "TPMSFlags: %u\n", (unsigned)frame->flags);
+            RAW_WRITE(line);
+            snprintf(
+                line,
+                sizeof(line),
+                "TPMSPressureKpaX100: %ld\n",
+                (long)frame->pressure_kpa_x100);
+            RAW_WRITE(line);
+            snprintf(
+                line,
+                sizeof(line),
+                "TPMSTemperatureC: %d\n",
+                (int)frame->temperature_c);
+            RAW_WRITE(line);
+            snprintf(line, sizeof(line), "TPMSRssiX10: %d\n", (int)capture->rssi_x10);
+            RAW_WRITE(line);
+        }
         size_t i = 0;
         while(i < capture->snapshot_count) {
             RAW_WRITE("RAW_Data:");
@@ -163,6 +223,12 @@ static void tpms_raw_save(TpmsRawCapture* capture) {
             RAW_WRITE("\n");
         }
         storage_file_close(file);
+        if(capture->has_frame) {
+            capture->last_saved_protocol = capture->frame.protocol;
+            capture->last_saved_id = capture->frame.id;
+            capture->last_saved_tick = furi_get_tick();
+            capture->last_saved_valid = true;
+        }
     }
 #undef RAW_WRITE
     storage_file_free(file);
@@ -176,6 +242,27 @@ static bool tpms_raw_name_is_sub(const char* name) {
 
 static void tpms_raw_build_path(char* path, size_t path_size, const char* name) {
     snprintf(path, path_size, TPMS_RAW_DIR "/%s", name);
+}
+
+static void tpms_raw_clear_file_tpms(TpmsBridgeApp* app) {
+    app->raw_file_tpms_valid = false;
+    app->raw_file_tpms_protocol = 0;
+    app->raw_file_tpms_id = 0;
+    app->raw_file_tpms_pressure_kpa_x100 = 0;
+    app->raw_file_tpms_temperature_c = 0;
+    app->raw_file_tpms_rssi_x10 = 0;
+    app->raw_file_tpms_have = 0;
+    app->raw_file_tpms_flags = 0;
+}
+
+static void tpms_raw_store_file_frame(TpmsBridgeApp* app, const TpmsFrame* frame) {
+    app->raw_file_tpms_valid = true;
+    app->raw_file_tpms_protocol = frame->protocol;
+    app->raw_file_tpms_id = frame->id;
+    app->raw_file_tpms_pressure_kpa_x100 = frame->pressure_kpa_x100;
+    app->raw_file_tpms_temperature_c = frame->temperature_c;
+    app->raw_file_tpms_have = frame->have;
+    app->raw_file_tpms_flags = frame->flags;
 }
 
 static FuriHalSubGhzPreset tpms_raw_preset_from_name(const char* preset_name) {
@@ -252,6 +339,8 @@ static void tpms_raw_update_selected_info(TpmsBridgeApp* app) {
     app->raw_file_size = 0;
     app->raw_file_frequency = 0;
     app->raw_file_protocol[0] = '\0';
+    tpms_raw_clear_file_tpms(app);
+    strlcpy(app->raw_message, "No TPMS meta", sizeof(app->raw_message));
     if(app->raw_file_count == 0) return;
 
     char path[96];
@@ -266,6 +355,8 @@ static void tpms_raw_update_selected_info(TpmsBridgeApp* app) {
     FlipperFormat* file = flipper_format_file_alloc(storage);
     FuriString* text = furi_string_alloc();
     uint32_t version = 0;
+    uint32_t value = 0;
+    int32_t signed_value = 0;
     do {
         if(!flipper_format_file_open_existing(file, path)) break;
         if(!flipper_format_read_header(file, text, &version)) break;
@@ -273,10 +364,141 @@ static void tpms_raw_update_selected_info(TpmsBridgeApp* app) {
         if(flipper_format_read_string(file, "Protocol", text)) {
             strlcpy(app->raw_file_protocol, furi_string_get_cstr(text), sizeof(app->raw_file_protocol));
         }
+        TpmsFrame frame;
+        memset(&frame, 0, sizeof(frame));
+        if(flipper_format_read_uint32(file, "TPMSProtocol", &value, 1)) {
+            frame.protocol = (uint8_t)value;
+            if(flipper_format_read_uint32(file, "TPMSID", &value, 1)) frame.id = value;
+            if(flipper_format_read_uint32(file, "TPMSHave", &value, 1)) frame.have = (uint8_t)value;
+            if(flipper_format_read_uint32(file, "TPMSFlags", &value, 1)) frame.flags = (uint8_t)value;
+            if(flipper_format_read_int32(file, "TPMSPressureKpaX100", &signed_value, 1)) {
+                frame.pressure_kpa_x100 = signed_value;
+            }
+            if(flipper_format_read_int32(file, "TPMSTemperatureC", &signed_value, 1)) {
+                frame.temperature_c = (int16_t)signed_value;
+            }
+            tpms_raw_store_file_frame(app, &frame);
+            if(flipper_format_read_int32(file, "TPMSRssiX10", &signed_value, 1)) {
+                app->raw_file_tpms_rssi_x10 = (int16_t)signed_value;
+            }
+            strlcpy(app->raw_message, "Meta OK", sizeof(app->raw_message));
+        }
     } while(false);
     furi_string_free(text);
     flipper_format_free(file);
     furi_record_close(RECORD_STORAGE);
+}
+
+typedef struct {
+    bool found;
+    TpmsFrame frame;
+} TpmsRawDecodeContext;
+
+static void tpms_raw_decode_callback(const TpmsFrame* frame, void* context) {
+    TpmsRawDecodeContext* decode = context;
+    if(decode->found) return;
+    decode->frame = *frame;
+    decode->found = true;
+}
+
+static void tpms_raw_decode_line(TpmsDecoder* decoder, const char* line) {
+    if(strncmp(line, "RAW_Data:", 9) != 0) return;
+
+    const char* cursor = line + 9;
+    while(*cursor) {
+        while(*cursor == ' ' || *cursor == '\t') cursor++;
+        if(!*cursor) break;
+
+        char* end = NULL;
+        const long value = strtol(cursor, &end, 10);
+        if(end == cursor) break;
+
+        const bool level = value > 0;
+        const uint32_t duration = (uint32_t)(value < 0 ? -value : value);
+        if(duration > 0) tpms_decoder_feed(decoder, level, duration);
+        cursor = end;
+    }
+}
+
+static bool tpms_raw_decode_path(const char* path, TpmsModulation modulation, TpmsFrame* out_frame) {
+    TpmsRawDecodeContext decode = {0};
+    TpmsDecoder* decoder = tpms_decoder_alloc(tpms_raw_decode_callback, &decode);
+    tpms_decoder_set_modulation(decoder, modulation);
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    File* file = storage_file_alloc(storage);
+    bool opened = storage_file_open(file, path, FSAM_READ, FSOM_OPEN_EXISTING);
+
+    char buffer[128];
+    char line[512];
+    size_t line_len = 0;
+    while(opened && !decode.found) {
+        const size_t read = storage_file_read(file, buffer, sizeof(buffer));
+        if(read == 0) break;
+
+        for(size_t i = 0; i < read && !decode.found; i++) {
+            const char c = buffer[i];
+            if(c == '\r') continue;
+            if(c == '\n') {
+                line[line_len] = '\0';
+                tpms_raw_decode_line(decoder, line);
+                line_len = 0;
+            } else if(line_len + 1 < sizeof(line)) {
+                line[line_len++] = c;
+            }
+        }
+    }
+    if(opened && !decode.found && line_len > 0) {
+        line[line_len] = '\0';
+        tpms_raw_decode_line(decoder, line);
+    }
+
+    if(opened) storage_file_close(file);
+    storage_file_free(file);
+    furi_record_close(RECORD_STORAGE);
+
+    if(decode.found && out_frame) *out_frame = decode.frame;
+    tpms_decoder_free(decoder);
+    return decode.found;
+}
+
+static bool tpms_raw_decode_selected(TpmsBridgeApp* app) {
+    if(app->raw_file_count == 0) return false;
+
+    tpms_raw_update_selected_info(app);
+    if(app->raw_file_tpms_valid) {
+        strlcpy(app->raw_message, "Meta OK", sizeof(app->raw_message));
+        return true;
+    }
+
+    char path[96];
+    tpms_raw_build_path(path, sizeof(path), app->raw_file_names[app->raw_file_selected]);
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    FlipperFormat* file = flipper_format_file_alloc(storage);
+    FuriString* text = furi_string_alloc();
+    TpmsModulation modulation = TpmsModulationFsk;
+    do {
+        if(!flipper_format_file_open_existing(file, path)) break;
+        if(flipper_format_read_string(file, "Preset", text)) {
+            if(strstr(furi_string_get_cstr(text), "Ook")) modulation = TpmsModulationOok;
+        }
+    } while(false);
+    furi_string_free(text);
+    flipper_format_free(file);
+    furi_record_close(RECORD_STORAGE);
+
+    TpmsFrame frame;
+    memset(&frame, 0, sizeof(frame));
+    if(tpms_raw_decode_path(path, modulation, &frame)) {
+        tpms_raw_store_file_frame(app, &frame);
+        app->raw_file_tpms_rssi_x10 = 0;
+        strlcpy(app->raw_message, "Decoded", sizeof(app->raw_message));
+        return true;
+    }
+
+    strlcpy(app->raw_message, "No TPMS data", sizeof(app->raw_message));
+    return false;
 }
 
 static bool tpms_raw_delete_selected(TpmsBridgeApp* app) {
@@ -296,6 +518,56 @@ static bool tpms_raw_delete_selected(TpmsBridgeApp* app) {
         strlcpy(app->raw_message, "Delete failed", sizeof(app->raw_message));
     }
     return ok;
+}
+static bool tpms_raw_find_first_sub(Storage* storage, char* name, size_t name_size) {
+    File* dir = storage_file_alloc(storage);
+    FileInfo info;
+    bool found = false;
+
+    if(storage_dir_open(dir, TPMS_RAW_DIR)) {
+        while(storage_dir_read(dir, &info, name, name_size)) {
+            if(!file_info_is_dir(&info) && tpms_raw_name_is_sub(name)) {
+                found = true;
+                break;
+            }
+        }
+        storage_dir_close(dir);
+    }
+
+    storage_file_free(dir);
+    return found;
+}
+
+static bool tpms_raw_delete_all(TpmsBridgeApp* app) {
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    char name[TPMS_RAW_NAME_MAX];
+    char path[96];
+    uint32_t deleted = 0;
+    bool failed = false;
+
+    while(tpms_raw_find_first_sub(storage, name, sizeof(name))) {
+        tpms_raw_build_path(path, sizeof(path), name);
+        if(storage_common_remove(storage, path) != FSE_OK) {
+            failed = true;
+            break;
+        }
+        deleted++;
+    }
+
+    furi_record_close(RECORD_STORAGE);
+    tpms_raw_refresh_files(app);
+
+    if(failed) {
+        strlcpy(app->raw_message, "Delete failed", sizeof(app->raw_message));
+        return false;
+    }
+    if(deleted == 0) {
+        strlcpy(app->raw_message, "No files", sizeof(app->raw_message));
+        return false;
+    }
+
+    snprintf(app->raw_message, sizeof(app->raw_message), "Deleted %lu", (unsigned long)deleted);
+    return true;
 }
 
 typedef struct {
@@ -420,10 +692,9 @@ static void tpms_raw_tx_free(TpmsRawTx* tx) {
         subghz_devices_idle(tx->device);
         subghz_devices_sleep(tx->device);
     }
-    if(tx->device_begun) {
+    if(tx->device_external && tx->device_begun) {
         subghz_devices_end(tx->device);
     }
-    subghz_devices_deinit();
     if(tx->external_power_owned) {
         Power* power = furi_record_open(RECORD_POWER);
         power_enable_otg(power, false);
@@ -460,14 +731,16 @@ static void tpms_raw_choose_device(TpmsRawTx* tx) {
     const SubGhzDevice* device = subghz_devices_get_by_name(SUBGHZ_DEVICE_CC1101_EXT_NAME);
     if(device == NULL) {
         FURI_LOG_E(TAG, "No %s driver loaded", SUBGHZ_DEVICE_CC1101_EXT_NAME);
-    } else if(subghz_devices_begin(device)) {
-        tx->device = device;
-        tx->device_external = true;
-        tx->device_begun = true;
-        return;
     } else {
-        subghz_devices_end(device);
-        FURI_LOG_W(TAG, "External radio did not answer, using internal");
+        const bool external_connected = subghz_devices_is_connect(device);
+        if(external_connected && subghz_devices_begin(device)) {
+            tx->device = device;
+            tx->device_external = true;
+            tx->device_begun = true;
+            return;
+        }
+        if(external_connected) subghz_devices_end(device);
+        FURI_LOG_W(TAG, "External radio unavailable, using internal");
     }
 
     tpms_radio_external_power_off(tx);
@@ -497,8 +770,6 @@ static TpmsRawTx* tpms_raw_tx_alloc(const char* path, char* message, size_t mess
     FlipperFormat* raw_data = flipper_format_string_alloc();
     FuriString* text = furi_string_alloc();
     tx->environment = tpms_raw_environment_alloc();
-
-    subghz_devices_init();
 
     do {
         tpms_raw_choose_device(tx);
@@ -710,6 +981,7 @@ static int32_t tpms_bridge_local_rx_thread(void* context) {
     if(furi_mutex_acquire(app->radio_mutex, 0) != FuriStatusOk) {
         FURI_LOG_W(TAG, "radio busy, local rx cancelled");
         app->local_rx = false;
+        app->rx_device_ready = false;
         view_port_update(app->view_port);
         return 0;
     }
@@ -727,19 +999,29 @@ static int32_t tpms_bridge_local_rx_thread(void* context) {
     if(tpms_session_start(session, tpms_slot_frequency(slot), tpms_slot_modulation(slot))) {
         app->active_slot = slot;
         app->rx_device_external = tpms_session_is_external(session);
-        uint32_t last_wake = 0;
+        app->rx_device_ready = true;
+        app->radio_start_error = false;
+        FURI_LOG_I(TAG, "RX started on %s", app->rx_device_external ? "EXT" : "INT");
         bool raw_was_enabled = false;
         uint8_t previous_slot = app->active_slot;
+        if(app->auto_wake) {
+            app->wake_next_tick = furi_get_tick() + furi_ms_to_ticks(TPMS_LF_PERIOD_MS);
+        }
 
         while(app->rx_enabled && app->local_rx && !app->stop_requested && !app->radio_yield_requested) {
+            const uint32_t now = furi_get_tick();
+            if(!app->auto_wake) {
+                app->wake_next_tick = 0;
+            } else if(app->wake_next_tick == 0) {
+                app->wake_next_tick = now + furi_ms_to_ticks(TPMS_LF_PERIOD_MS);
+            }
             const bool wake_due = app->auto_wake &&
-                                  (last_wake == 0 || furi_get_tick() - last_wake >
-                                                         furi_ms_to_ticks(TPMS_LF_PERIOD_MS));
+                                  (int32_t)(now - app->wake_next_tick) >= 0;
 
             if(wake_due || app->wake_requested) {
                 app->wake_requested = false;
-                last_wake = furi_get_tick();
-                app->wake_feedback_tick = last_wake;
+                app->wake_feedback_tick = now;
+                app->wake_next_tick = now + furi_ms_to_ticks(TPMS_LF_PERIOD_MS);
                 tpms_session_wake_pulse(session, TPMS_LF_PULSE_MS);
             }
 
@@ -760,11 +1042,13 @@ static int32_t tpms_bridge_local_rx_thread(void* context) {
             /* The standard display callback is kept. Saving is triggered
              * only by a decoded valid frame, using the preceding pulse history. */
             tpms_session_pump(session, 100);
+            if(enabled && raw->post_capture) tpms_raw_finish_post_capture(raw);
             if(enabled && raw->pending) tpms_raw_save(raw);
         }
         tpms_session_stop(session);
     } else {
         FURI_LOG_E(TAG, "cannot start local rx");
+        app->radio_start_error = true;
     }
 
     tpms_session_free(session);
@@ -772,14 +1056,31 @@ static int32_t tpms_bridge_local_rx_thread(void* context) {
     furi_mutex_release(app->radio_mutex);
 
     app->local_rx = false;
+    app->rx_device_ready = false;
     app->rx_device_external = false;
+    app->wake_next_tick = 0;
     app->last_radio_stop_tick = furi_get_tick();
     view_port_update(app->view_port);
     return 0;
 }
 
-static void tpms_bridge_stop_local_rx(TpmsBridgeApp* app) {
+static void tpms_bridge_request_local_rx_stop(TpmsBridgeApp* app) {
     app->local_rx = false;
+    app->rx_device_ready = false;
+    app->wake_next_tick = 0;
+}
+
+static void tpms_bridge_cleanup_local_rx(TpmsBridgeApp* app) {
+    if(!app->local_thread) return;
+    if(furi_thread_get_state(app->local_thread) != FuriThreadStateStopped) return;
+    furi_thread_join(app->local_thread);
+    furi_thread_free(app->local_thread);
+    app->local_thread = NULL;
+    app->last_radio_stop_tick = furi_get_tick();
+}
+
+static void tpms_bridge_stop_local_rx(TpmsBridgeApp* app) {
+    tpms_bridge_request_local_rx_stop(app);
     if(!app->local_thread) return;
 
     furi_thread_join(app->local_thread);
@@ -792,29 +1093,41 @@ static void tpms_bridge_toggle_local_rx(TpmsBridgeApp* app) {
     app->rx_enabled = !app->rx_enabled;
     if(!app->rx_enabled) {
         app->local_rx = false;
+        app->rx_device_ready = false;
+        app->radio_start_error = false;
+        app->wake_next_tick = 0;
         strlcpy(app->raw_message, "RX OFF", sizeof(app->raw_message));
     } else {
+        app->radio_start_error = false;
+        if(app->auto_wake) {
+            app->wake_next_tick = furi_get_tick() + furi_ms_to_ticks(TPMS_LF_PERIOD_MS);
+        }
         strlcpy(app->raw_message, "RX ON", sizeof(app->raw_message));
     }
+}
+
+static void tpms_bridge_stop_rx_from_ui(TpmsBridgeApp* app) {
+    app->rx_enabled = false;
+    app->radio_start_error = false;
+    tpms_bridge_request_local_rx_stop(app);
+    strlcpy(app->raw_message, "RX OFF", sizeof(app->raw_message));
 }
 
 /** Keeps local reception running while the radio is free, and gets it out
  * of the way once a USB session comes for the radio. */
 static void tpms_bridge_reconcile_radio(TpmsBridgeApp* app) {
+    tpms_bridge_cleanup_local_rx(app);
+
+    if(app->local_thread && !app->local_rx) return;
+
     if(app->screen != TpmsScreenList) {
-        tpms_bridge_stop_local_rx(app);
+        tpms_bridge_request_local_rx_stop(app);
         return;
     }
 
     if(!app->rx_enabled) {
-        tpms_bridge_stop_local_rx(app);
+        tpms_bridge_request_local_rx_stop(app);
         return;
-    }
-
-    if(app->local_thread && !app->local_rx) {
-        furi_thread_join(app->local_thread);
-        furi_thread_free(app->local_thread);
-        app->local_thread = NULL;
     }
 
     if(app->local_thread) return;
@@ -834,6 +1147,7 @@ static void tpms_bridge_reconcile_radio(TpmsBridgeApp* app) {
     app->radio_retry_tick = now;
 
     app->local_rx = true;
+    app->rx_device_ready = false;
     app->local_thread =
         furi_thread_alloc_ex("TpmsLocalRx", 2048, tpms_bridge_local_rx_thread, app);
     furi_thread_start(app->local_thread);
@@ -864,16 +1178,13 @@ static void tpms_bridge_select(TpmsBridgeApp* app, int8_t delta) {
     tpms_view_follow_selection(app);
 }
 
-static void tpms_bridge_wake_sensor(TpmsBridgeApp* app) {
-    /* If reception is running the pulse must not stop the receiver: the
-     * sensor answers right away. Decoding is driven by the session owner,
-     * so all we do here is raise a flag. */
-    if(app->local_thread || app->usb_streaming) {
-        app->wake_requested = true;
-        return;
-    }
-
-    tpms_lf_wake(TPMS_LF_PULSE_MS);
+static void tpms_bridge_toggle_auto_wake(TpmsBridgeApp* app) {
+    app->auto_wake = !app->auto_wake;
+    app->wake_requested = false;
+    app->wake_feedback_tick = 0;
+    app->wake_next_tick = app->auto_wake && app->local_rx ?
+                              furi_get_tick() + furi_ms_to_ticks(TPMS_LF_PERIOD_MS) :
+                              0;
 }
 
 static void tpms_bridge_apply_backlight(TpmsBridgeApp* app) {
@@ -883,18 +1194,24 @@ static void tpms_bridge_apply_backlight(TpmsBridgeApp* app) {
                                  &sequence_display_backlight_enforce_auto);
 }
 
-static void tpms_bridge_raw_tx_stop(TpmsBridgeApp* app) {
+static void tpms_bridge_raw_tx_stop_ex(TpmsBridgeApp* app, bool cooldown, bool keep_button_down) {
+    const bool button_down = app->raw_tx_button_down;
     TpmsRawTx* tx = app->raw_tx;
     app->raw_tx = NULL;
     app->raw_tx_active = false;
     app->raw_tx_finishing = false;
-    app->raw_tx_button_down = false;
+    app->raw_tx_button_down = keep_button_down ? button_down : false;
     app->radio_yield_requested = false;
     subghz_block_generic_global.endless_tx = false;
     if(tx) tpms_raw_tx_free(tx);
     app->last_radio_stop_tick = furi_get_tick();
-    app->tx_cooldown_until_tick = app->last_radio_stop_tick + furi_ms_to_ticks(TPMS_TX_COOLDOWN_MS);
-    strlcpy(app->raw_message, "Wait...", sizeof(app->raw_message));
+    app->tx_cooldown_until_tick =
+        cooldown ? app->last_radio_stop_tick + furi_ms_to_ticks(TPMS_TX_COOLDOWN_MS) : 0;
+    strlcpy(app->raw_message, cooldown ? "Wait..." : "Hold OK to send", sizeof(app->raw_message));
+}
+
+static void tpms_bridge_raw_tx_stop(TpmsBridgeApp* app) {
+    tpms_bridge_raw_tx_stop_ex(app, true, false);
 }
 
 static void tpms_bridge_raw_tx_start(TpmsBridgeApp* app) {
@@ -916,6 +1233,8 @@ static void tpms_bridge_raw_tx_start(TpmsBridgeApp* app) {
         app->raw_tx_finishing = false;
         app->raw_tx_button_down = true;
         app->tx_device_external = tx->device_external;
+        app->raw_tx_display_until_tick =
+            furi_get_tick() + furi_ms_to_ticks(TPMS_TX_DISPLAY_HOLD_MS);
         app->radio_yield_requested = true;
     } else {
         app->raw_tx_button_down = false;
@@ -994,9 +1313,8 @@ static void tpms_bridge_handle_input(TpmsBridgeApp* app, const InputEvent* event
     }
 
     if(event->key == InputKeyLeft && wake_screen) {
-        app->wake_feedback_tick = furi_get_tick();
+        tpms_bridge_toggle_auto_wake(app);
         furi_mutex_release(app->state_mutex);
-        tpms_bridge_wake_sensor(app);
         return;
     }
 
@@ -1008,9 +1326,11 @@ static void tpms_bridge_handle_input(TpmsBridgeApp* app, const InputEvent* event
             tpms_bridge_raw_tx_stop(app);
             app->screen = TpmsScreenRawFiles;
         } else if(
-            app->screen == TpmsScreenRawMenu || app->screen == TpmsScreenRawInfo ||
-            app->screen == TpmsScreenRawConfirmDelete || app->screen == TpmsScreenRawMessage ||
-            app->screen == TpmsScreenRawHelp) {
+            app->screen == TpmsScreenRawMenu || app->screen == TpmsScreenRawOpen ||
+            app->screen == TpmsScreenRawInfo ||
+            app->screen == TpmsScreenRawConfirmDelete ||
+            app->screen == TpmsScreenRawConfirmDeleteAll ||
+            app->screen == TpmsScreenRawMessage || app->screen == TpmsScreenRawHelp) {
             app->screen = TpmsScreenRawFiles;
         } else if(app->screen == TpmsScreenRawFiles) {
             app->screen = TpmsScreenList;
@@ -1027,6 +1347,10 @@ static void tpms_bridge_handle_input(TpmsBridgeApp* app, const InputEvent* event
             }
         } else if(app->screen == TpmsScreenRawMenu) {
             switch(app->raw_menu_selected) {
+            case TpmsRawActionOpen:
+                tpms_raw_decode_selected(app);
+                app->screen = TpmsScreenRawOpen;
+                break;
             case TpmsRawActionPlay:
                 tpms_raw_build_path(
                     app->raw_tx_path,
@@ -1040,7 +1364,7 @@ static void tpms_bridge_handle_input(TpmsBridgeApp* app, const InputEvent* event
                 furi_delay_ms(TPMS_RADIO_SWITCH_DELAY_MS);
                 furi_mutex_acquire(app->state_mutex, FuriWaitForever);
                 break;
-            case TpmsRawActionInfo:
+            case TpmsRawActionRawInfo:
                 tpms_raw_update_selected_info(app);
                 app->screen = TpmsScreenRawInfo;
                 break;
@@ -1054,17 +1378,31 @@ static void tpms_bridge_handle_input(TpmsBridgeApp* app, const InputEvent* event
             case TpmsRawActionDelete:
                 app->screen = TpmsScreenRawConfirmDelete;
                 break;
+            case TpmsRawActionDeleteAll:
+                app->screen = TpmsScreenRawConfirmDeleteAll;
+                break;
             default:
                 break;
             }
         } else if(app->screen == TpmsScreenRawConfirmDelete) {
             tpms_raw_delete_selected(app);
             app->screen = TpmsScreenRawFiles;
+        } else if(app->screen == TpmsScreenRawConfirmDeleteAll) {
+            tpms_raw_delete_all(app);
+            app->screen = TpmsScreenRawFiles;
         } else if(app->screen == TpmsScreenRawTx) {
-        } else if(app->screen == TpmsScreenRawInfo || app->screen == TpmsScreenRawMessage) {
+        } else if(
+            app->screen == TpmsScreenRawOpen || app->screen == TpmsScreenRawInfo ||
+            app->screen == TpmsScreenRawMessage) {
             app->screen = TpmsScreenRawFiles;
         } else if(app->screen == TpmsScreenList) {
-            tpms_bridge_toggle_local_rx(app);
+            if(app->store.count > 0) {
+                tpms_bridge_stop_rx_from_ui(app);
+                tpms_view_follow_selection(app);
+                app->screen = TpmsScreenDetail;
+            } else {
+                tpms_bridge_toggle_local_rx(app);
+            }
         } else if(app->screen == TpmsScreenDetail) {
             app->screen = TpmsScreenList;
         } else {
@@ -1079,15 +1417,19 @@ static void tpms_bridge_handle_input(TpmsBridgeApp* app, const InputEvent* event
             tpms_bridge_raw_tx_stop(app);
             app->screen = TpmsScreenRawFiles;
         } else if(
-            app->screen == TpmsScreenRawMenu || app->screen == TpmsScreenRawInfo ||
-            app->screen == TpmsScreenRawConfirmDelete || app->screen == TpmsScreenRawMessage ||
-            app->screen == TpmsScreenRawHelp) {
+            app->screen == TpmsScreenRawMenu || app->screen == TpmsScreenRawOpen ||
+            app->screen == TpmsScreenRawInfo ||
+            app->screen == TpmsScreenRawConfirmDelete ||
+            app->screen == TpmsScreenRawConfirmDeleteAll ||
+            app->screen == TpmsScreenRawMessage || app->screen == TpmsScreenRawHelp) {
             app->screen = TpmsScreenRawFiles;
         } else if(app->screen == TpmsScreenRawFiles) {
             app->screen = TpmsScreenList;
+        } else if(app->screen == TpmsScreenList && app->store.count > 0) {
+            tpms_bridge_stop_rx_from_ui(app);
+            tpms_bridge_select(app, -1);
         } else {
-            app->auto_wake = !app->auto_wake;
-            if(app->auto_wake) app->wake_feedback_tick = furi_get_tick();
+            tpms_bridge_toggle_auto_wake(app);
         }
         break;
 
@@ -1119,6 +1461,9 @@ static void tpms_bridge_handle_input(TpmsBridgeApp* app, const InputEvent* event
                 (uint8_t)((app->raw_help_page + TPMS_RAW_HELP_PAGES + delta) % TPMS_RAW_HELP_PAGES);
         } else if(app->screen == TpmsScreenDetail) {
             tpms_bridge_select(app, delta);
+        } else if(app->screen == TpmsScreenList && app->store.count > 0) {
+            tpms_bridge_stop_rx_from_ui(app);
+            tpms_bridge_select(app, delta);
         } else {
             tpms_bridge_step_config(app, delta);
         }
@@ -1139,6 +1484,7 @@ static TpmsBridgeApp* tpms_bridge_app_alloc(void) {
     app->state_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
     app->radio_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
     app->input_queue = furi_message_queue_alloc(TPMS_INPUT_QUEUE_SIZE, sizeof(InputEvent));
+    subghz_devices_init();
 
     app->view_port = view_port_alloc();
     view_port_draw_callback_set(app->view_port, tpms_bridge_draw_callback, app);
@@ -1169,7 +1515,7 @@ static TpmsBridgeApp* tpms_bridge_app_alloc(void) {
 static void tpms_bridge_tick_notifications(TpmsBridgeApp* app) {
     const uint32_t now = furi_get_tick();
 
-    if(app->screen == TpmsScreenList && app->local_rx &&
+    if(app->screen == TpmsScreenList && app->rx_device_ready &&
        now - app->last_rx_blink_tick > furi_ms_to_ticks(1000)) {
         app->last_rx_blink_tick = now;
         notification_message(app->notifications, &sequence_blink_cyan_10);
@@ -1184,9 +1530,14 @@ static void tpms_bridge_tick_notifications(TpmsBridgeApp* app) {
             }
         } else {
             furi_mutex_acquire(app->state_mutex, FuriWaitForever);
-            tpms_bridge_raw_tx_stop(app);
-            if(app->tx_cooldown_until_tick == 0) {
-                strlcpy(app->raw_message, "Hold OK to send", sizeof(app->raw_message));
+            if(app->raw_tx_button_down && !app->raw_tx_finishing && app->screen == TpmsScreenRawTx) {
+                tpms_bridge_raw_tx_stop_ex(app, false, true);
+                tpms_bridge_raw_tx_start(app);
+            } else {
+                tpms_bridge_raw_tx_stop(app);
+                if(app->tx_cooldown_until_tick == 0) {
+                    strlcpy(app->raw_message, "Hold OK to send", sizeof(app->raw_message));
+                }
             }
             furi_mutex_release(app->state_mutex);
         }
@@ -1216,6 +1567,7 @@ static void tpms_bridge_app_free(TpmsBridgeApp* app) {
     view_port_free(app->view_port);
 
     furi_message_queue_free(app->input_queue);
+    subghz_devices_deinit();
     furi_mutex_free(app->radio_mutex);
     furi_mutex_free(app->state_mutex);
     free(app);

@@ -13,7 +13,7 @@
 
 #define TPMS_CLI_COMMAND_NAME "tpms_rx"
 #define TPMS_APP_TITLE "TPMS Studio"
-#define TPMS_APP_VERSION "v1.0"
+#define TPMS_APP_VERSION "v1.11"
 
 /** Stack size of the CLI command thread. */
 #define TPMS_CLI_STACK_SIZE (4 * 1024)
@@ -30,8 +30,10 @@ typedef enum {
     TpmsScreenDetail, /**< details of the selected sensor */
     TpmsScreenRawFiles, /**< saved raw captures */
     TpmsScreenRawMenu, /**< actions for selected raw file */
+    TpmsScreenRawOpen, /**< decoded TPMS data from selected raw file */
     TpmsScreenRawInfo, /**< selected raw file info */
     TpmsScreenRawConfirmDelete, /**< delete confirmation */
+    TpmsScreenRawConfirmDeleteAll, /**< delete all confirmation */
     TpmsScreenRawMessage, /**< short placeholder/status message */
     TpmsScreenRawHelp, /**< built-in usage notes */
     TpmsScreenRawTx, /**< hold-to-transmit status */
@@ -69,12 +71,16 @@ typedef struct {
     volatile bool raw_save; /**< hold Left to toggle */
     volatile bool auto_wake; /**< periodic pulses */
     bool keep_backlight_on;
+    volatile bool rx_device_ready;
+    volatile bool radio_start_error;
     bool rx_device_external;
     bool tx_device_external;
     bool raw_tx_active;
     bool raw_tx_finishing;
     bool raw_tx_button_down;
+    uint32_t raw_tx_display_until_tick;
     uint32_t wake_feedback_tick;
+    uint32_t wake_next_tick;
     uint32_t last_rx_blink_tick;
     uint32_t last_tx_blink_tick;
     uint32_t tx_cooldown_until_tick;
@@ -99,6 +105,14 @@ typedef struct {
     uint64_t raw_file_size;
     uint32_t raw_file_frequency;
     char raw_file_protocol[16];
+    bool raw_file_tpms_valid;
+    uint8_t raw_file_tpms_protocol;
+    uint32_t raw_file_tpms_id;
+    int32_t raw_file_tpms_pressure_kpa_x100;
+    int16_t raw_file_tpms_temperature_c;
+    int16_t raw_file_tpms_rssi_x10;
+    uint8_t raw_file_tpms_have;
+    uint8_t raw_file_tpms_flags;
     char raw_tx_path[96];
     void* raw_tx;
     char raw_file_names[TPMS_RAW_FILE_MAX][TPMS_RAW_NAME_MAX];

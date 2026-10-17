@@ -25,3 +25,9 @@ JSON.
 
 Only the Renault group sensor has been verified against real hardware;
 every other decoder is checked against rtl_433 itself.
+# v1.11
+
+- Fixed internal CC1101 fallback and lifecycle.
+- External CC1101 is probed before it is opened.
+- Added RX WAIT/INT/EXT/ERR status handling.
+- Flushes the RX FIFO before receive and retune.

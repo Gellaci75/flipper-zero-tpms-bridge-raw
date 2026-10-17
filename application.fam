@@ -1,5 +1,5 @@
 App(
-    appid="tpms_bridge_raw",
+    appid="tpms_studio_v111",
     name="TPMS Studio",
     apptype=FlipperAppType.EXTERNAL,
     targets=["f7"],
@@ -9,7 +9,7 @@ App(
     fap_category="Sub-GHz",
     fap_author="Laszlo",
     fap_weburl="https://github.com/VishovVladimir/flipper-zero-tpms",
-    fap_version="1.0",
+    fap_version="1.11",
     fap_description="TPMS monitor, RAW capture, file manager, and Sub-GHz playback helper",
 )
 
